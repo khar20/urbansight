@@ -1,0 +1,7 @@
+__pycache__
+.venv
+camera_input
+yolo11s.pt
+frontend
+multicam-track
+app.py
