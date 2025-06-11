@@ -1,8 +1,8 @@
 __pycache__
 .venv
-camera_input
 yolo11s.pt
 frontend
 app.py
 qml
 result
+track-api

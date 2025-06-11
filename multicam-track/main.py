@@ -9,7 +9,6 @@ from threading import Lock, Thread
 from collections import defaultdict
 from torchvision import transforms
 from ultralytics import YOLO
-
 import queue
 import time
 
@@ -20,7 +19,8 @@ except ImportError:
         def __init__(self):
             super().__init__()
             self.dummy_feature_dim = 2048
-            self.linear = torch.nn.Linear(224 * 224 * 3, self.dummy_feature_dim)
+            self.linear = torch.nn.Linear(
+                224 * 224 * 3, self.dummy_feature_dim)
 
         def forward(self, x):
             return torch.rand(x.shape[0], self.dummy_feature_dim)
@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 
-
+# Configuration
 SOURCES_FOLDER = './camera_input'
 SOURCES = ['c1.mp4', 'c2.mp4', 'c3.mp4']
 VIDEO_SOURCES = [os.path.join(SOURCES_FOLDER, src) for src in SOURCES]
@@ -45,39 +45,14 @@ SIMILARITY_THRESHOLD = 0.7
 MAX_COMPARISONS = 5
 YOLO_CLASSES = [2, 5, 7]
 
-
-def create_dummy_video(path, duration_seconds=10, fps=25, resolution=(640, 480)):
-    """Creates a dummy video file for testing purposes."""
-    if not os.path.exists(path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(path, fourcc, fps, resolution)
-
-        if not out.isOpened():
-            return
-
-        for i in range(duration_seconds * fps):
-            frame = np.zeros((resolution[1], resolution[0], 3), dtype=np.uint8)
-            cv2.putText(frame, f"Cámara {os.path.basename(path).split('.')[0]}", (50, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            cv2.circle(frame, (resolution[0]//2 + int(100*np.sin(i*0.1)),
-                               resolution[1]//2 + int(50*np.cos(i*0.05))),
-                       30, (0, 255, 0), -1)
-            cv2.rectangle(frame, (int(100*np.sin(i*0.08))+50, int(100*np.cos(i*0.03))+50),
-                                 (int(100*np.sin(i*0.08))+150, int(100*np.cos(i*0.03))+150),
-                                 (0, 0, 255), 2)
-            out.write(frame)
-        out.release()
-
-for src_path in VIDEO_SOURCES:
-    create_dummy_video(src_path)
-
+# Initialize models
 reid_model = None
 reid_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
+
 try:
     reid_model = load_model_from_opts(
         REID_OPTS_PATH, ckpt=REID_MODEL_PATH, remove_classifier=True)
@@ -85,6 +60,7 @@ try:
 except Exception as e:
     reid_model = DummyReIDModel()
     reid_model.eval().to("cpu")
+
 
 def extract_reid_feature(image):
     """Extracts a re-identification feature vector from an image."""
@@ -105,14 +81,16 @@ def extract_reid_feature(image):
     except Exception as e:
         return torch.rand(reid_model.dummy_feature_dim if hasattr(reid_model, 'dummy_feature_dim') else 2048)
 
+
 yolo_model = None
 try:
     yolo_model = YOLO(YOLO_MODEL_PATH)
 except Exception as e:
     pass
 
+
 class VideoProcessor(QThread):
-    """Processes video frames, performs YOLO detection, and Re-ID comparison."""
+    """Optimized video processing thread with batch operations."""
     update_frame = pyqtSignal(list, dict)
     update_similarities = pyqtSignal(dict)
     update_query = pyqtSignal(np.ndarray)
@@ -126,87 +104,111 @@ class VideoProcessor(QThread):
         self.query_lock = Lock()
         self.similar_vehicles = {}
         self.similar_vehicles_lock = Lock()
+        self.frame_buffer = [None] * len(VIDEO_SOURCES)
 
     def set_query_feature(self, feature, image):
         """Sets the feature and image of the query vehicle."""
         with self.query_lock:
+            if self.query_feature is not None:
+                del self.query_feature
             self.query_feature = feature
             self.query_image = image.copy()
             self.update_query.emit(image)
 
     def run(self):
-        """Main loop for video processing."""
+        """Main optimized processing loop with batch operations."""
         while self.running:
-            frames_np = []
+            frames_np = [None] * len(self.caps)
             all_detections = defaultdict(list)
+            frames_to_process = []
+            indices_to_process = []
 
+            # Read frames and prepare for processing
             for i, cap in enumerate(self.caps):
                 ret, frame = cap.read()
                 if not ret:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ret, frame = cap.read()
-                    if not ret:
-                        frames_np.append(None)
-                        continue
+                    continue
+                frames_np[i] = frame
+                frames_to_process.append(frame)
+                indices_to_process.append(i)
 
-                current_boxes = []
-                if yolo_model:
-                    try:
-                        results = yolo_model(frame, classes=YOLO_CLASSES, verbose=False, conf=0.4)
-                        boxes = results[0].boxes
-                        for box in boxes:
-                            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                            current_boxes.append((x1, y1, x2, y2))
-                            crop = frame[y1:y2, x1:x2]
+            # Batch processing if we have frames and models
+            if yolo_model and frames_to_process:
+                # Batch process frames with YOLO
+                results = yolo_model(frames_to_process, classes=YOLO_CLASSES,
+                                     verbose=False, conf=0.4, batch=len(frames_to_process))
 
-                            if crop.size == 0 or crop.shape[0] == 0 or crop.shape[1] == 0:
-                                continue
+                # Collect crops for batch ReID processing
+                all_crops = []
+                crop_info = []
 
-                            with self.query_lock:
-                                current_query_feature = self.query_feature
-                                current_query_image = self.query_image
+                for j, res in enumerate(results):
+                    i_cam = indices_to_process[j]
+                    frame = frames_to_process[j]
+                    boxes = res.boxes
+                    for box in boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        crop = frame[y1:y2, x1:x2]
+                        if crop.size == 0:
+                            continue
+                        all_crops.append(crop)
+                        crop_info.append((i_cam, x1, y1, x2, y2))
+                        all_detections[i_cam].append((x1, y1, x2, y2))
 
-                            if current_query_feature is not None:
-                                feature = extract_reid_feature(crop)
-                                sim = torch.dot(current_query_feature, feature).item()
+                # Batch process crops with ReID if we have a query
+                with self.query_lock:
+                    current_query_feature = self.query_feature
 
-                                if sim > SIMILARITY_THRESHOLD:
-                                    with self.similar_vehicles_lock:
-                                        key = (i, x1, y1, x2, y2)
-                                        self.similar_vehicles[key] = {
-                                            'frame': crop.copy(),
-                                            'similarity': sim,
-                                            'source': i,
-                                            'timestamp': time.time(),
-                                            'feature': feature
-                                        }
-                    except Exception as e:
-                        pass
-                
-                all_detections[i].extend(current_boxes)
-                frames_np.append(frame)
+                if all_crops and current_query_feature is not None:
+                    features = []
+                    for crop in all_crops:
+                        features.append(extract_reid_feature(crop))
+
+                    # Convert to tensor for efficient computation
+                    features_tensor = torch.stack(features)
+                    similarities = torch.mm(
+                        features_tensor,
+                        current_query_feature.unsqueeze(1)
+                    ).squeeze(1).cpu().numpy()
+
+                    for idx, sim in enumerate(similarities):
+                        if sim > SIMILARITY_THRESHOLD:
+                            i_cam, x1, y1, x2, y2 = crop_info[idx]
+                            key = (i_cam, x1, y1, x2, y2)
+                            with self.similar_vehicles_lock:
+                                self.similar_vehicles[key] = {
+                                    'frame': all_crops[idx].copy(),
+                                    'similarity': sim,
+                                    'source': i_cam,
+                                    'timestamp': time.time(),
+                                    'feature': features_tensor[idx].cpu()
+                                }
 
             self.update_frame.emit(frames_np, all_detections)
 
-            current_time = time.time()
+            # Clean up old similar vehicles
             with self.similar_vehicles_lock:
-                to_remove = [k for k, v in self.similar_vehicles.items()
-                             if current_time - v['timestamp'] > 5]
-                for k in to_remove:
-                    del self.similar_vehicles[k]
-                self.update_similarities.emit(self.similar_vehicles.copy())
+                current_time = time.time()
+                self.similar_vehicles = {k: v for k, v in self.similar_vehicles.items()
+                                         if current_time - v['timestamp'] <= 5}
+                self.update_similarities.emit(self.similar_vehicles)
 
             time.sleep(0.03)
 
     def stop(self):
-        """Stops the video processing thread."""
+        """Stops the video processing thread and cleans up resources."""
         self.running = False
         for cap in self.caps:
             cap.release()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self.wait()
 
+
 class CameraView(QLabel):
-    """Displays a single camera feed with vehicle detections."""
+    """Optimized camera view with selective rendering."""
+
     def __init__(self, camera_id):
         super().__init__()
         self.camera_id = camera_id
@@ -217,7 +219,6 @@ class CameraView(QLabel):
         self.selected_box = None
         self.click_callback = None
         self.current_frame = None
-
         self.setStyleSheet("border: 1px solid #ddd; background-color: black;")
         self.setText(f"Cargando Cámara {self.camera_id+1}...")
 
@@ -228,35 +229,42 @@ class CameraView(QLabel):
             self.clear()
             return
 
-        self.current_frame = frame.copy()
+        self.current_frame = frame
         self.detections = detections
         self.selected_box = selected_box
         self._draw_and_display()
 
     def _draw_and_display(self):
-        """Draws detections and displays the frame."""
-        if self.current_frame is None:
+        """Optimized drawing and display with selective rendering."""
+        if self.current_frame is None or not self.isVisible() or self.size().isEmpty():
             return
 
-        display_frame = self.current_frame.copy()
+        # Downsample for display
+        display_frame = cv2.resize(self.current_frame,
+                                   (self.width(), self.height()),
+                                   interpolation=cv2.INTER_AREA)
 
+        # Draw detections with scaled coordinates
         for (x1, y1, x2, y2) in self.detections:
-            is_selected = self.selected_box and \
-                          self.selected_box[0] == self.camera_id and \
-                          self.selected_box[1:] == (x1, y1, x2, y2)
+            # Scale coordinates to display size
+            sf_x = self.width() / self.current_frame.shape[1]
+            sf_y = self.height() / self.current_frame.shape[0]
+            dx1, dy1 = int(x1 * sf_x), int(y1 * sf_y)
+            dx2, dy2 = int(x2 * sf_x), int(y2 * sf_y)
 
-            color = (0, 0, 255) if is_selected else (255, 0, 0)
-            cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(display_frame, f"Cámara {self.camera_id+1}", (x1 + 5, y1 - 10),
+            # Draw rectangle
+            color = (0, 0, 255) if self.selected_box and \
+                self.selected_box[0] == self.camera_id and \
+                self.selected_box[1:] == (x1, y1, x2, y2) else (255, 0, 0)
+            cv2.rectangle(display_frame, (dx1, dy1), (dx2, dy2), color, 2)
+            cv2.putText(display_frame, f"Cámara {self.camera_id+1}", (dx1 + 5, dy1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
+        # Convert to QImage
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-
         h, w, ch = frame_rgb.shape
-        bytes_per_line = ch * w
-        q_img = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        self.setPixmap(QPixmap.fromImage(q_img).scaled(
-            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        q_img = QImage(frame_rgb.data, w, h, w * ch, QImage.Format_RGB888)
+        self.setPixmap(QPixmap.fromImage(q_img))
 
     def resizeEvent(self, event):
         """Handles widget resize events to redraw the frame."""
@@ -265,39 +273,48 @@ class CameraView(QLabel):
 
     def mousePressEvent(self, event):
         """Handles mouse clicks to select a vehicle."""
-        if event.button() == Qt.LeftButton and self.click_callback and self.pixmap() and self.current_frame is not None:
-            pixmap_scaled_width = self.pixmap().width()
-            pixmap_scaled_height = self.pixmap().height()
+        if (event.button() == Qt.LeftButton and self.click_callback and
+                self.pixmap() and self.current_frame is not None):
 
-            label_width = self.width()
-            label_height = self.height()
+            # Calculate click position in original frame coordinates
+            pixmap_size = self.pixmap().size()
+            label_size = self.size()
 
-            offset_x = (label_width - pixmap_scaled_width) / 2
-            offset_y = (label_height - pixmap_scaled_height) / 2
+            offset_x = (label_size.width() - pixmap_size.width()) / 2
+            offset_y = (label_size.height() - pixmap_size.height()) / 2
 
             x_rel_pixmap = event.pos().x() - offset_x
             y_rel_pixmap = event.pos().y() - offset_y
 
-            original_h, original_w, _ = self.current_frame.shape
-            x_on_frame = int(x_rel_pixmap * original_w / pixmap_scaled_width)
-            y_on_frame = int(y_rel_pixmap * original_h / pixmap_scaled_height)
+            # Scale to original frame coordinates
+            x_on_frame = int(
+                x_rel_pixmap * self.current_frame.shape[1] / pixmap_size.width())
+            y_on_frame = int(
+                y_rel_pixmap * self.current_frame.shape[0] / pixmap_size.height())
 
+            # Check if click is within any detection
             for (x1, y1, x2, y2) in self.detections:
                 if x1 <= x_on_frame <= x2 and y1 <= y_on_frame <= y2:
                     self.click_callback(self.camera_id, x1, y1, x2, y2)
                     break
 
+
 class SimilarVehicleWidget(QWidget):
-    """Displays a single similar vehicle match."""
+    """Optimized widget for displaying similar vehicle matches."""
+
     def __init__(self, match_data, query_img_data=None):
         super().__init__()
         self.match_data = match_data
         self.query_img_data = query_img_data
+        self.init_ui()
 
+    def init_ui(self):
+        """Initialize UI components."""
         main_layout = QHBoxLayout()
         main_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.setSpacing(10)
 
+        # Query image display
         self.query_label = QLabel()
         self.query_label.setFixedSize(100, 100)
         self.query_label.setAlignment(Qt.AlignCenter)
@@ -308,70 +325,75 @@ class SimilarVehicleWidget(QWidget):
             self.query_label.setText("Consulta")
         main_layout.addWidget(self.query_label)
 
+        # Arrow indicator
         arrow_label = QLabel("->")
         arrow_label.setFont(arrow_label.font())
         arrow_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(arrow_label)
 
+        # Match image display
         self.match_label = QLabel()
         self.match_label.setFixedSize(100, 100)
         self.match_label.setAlignment(Qt.AlignCenter)
-        self.update_image_label(self.match_label, match_data['frame'])
+        self.update_image_label(self.match_label, self.match_data['frame'])
         main_layout.addWidget(self.match_label)
 
+        # Information display
         info_label = QLabel(
-            f"Fuente: Cámara {match_data['source']+1}\n"
-            f"Similitud: {match_data['similarity']:.3f}\n"
-            f"Hora: {time.strftime('%H:%M:%S', time.localtime(match_data['timestamp']))}"
+            f"Fuente: Cámara {self.match_data['source']+1}\n"
+            f"Similitud: {self.match_data['similarity']:.3f}\n"
+            f"Hora: {time.strftime('%H:%M:%S', time.localtime(self.match_data['timestamp']))}"
         )
         info_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         main_layout.addWidget(info_label)
 
         main_layout.addStretch()
-
         self.setLayout(main_layout)
-        self.setStyleSheet("border: 1px solid #ccc; border-radius: 5px; background-color: #f0f0f0; margin-bottom: 5px;")
+        self.setStyleSheet("""
+            border: 1px solid #ccc; 
+            border-radius: 5px; 
+            background-color: #f0f0f0; 
+            margin-bottom: 5px;
+        """)
 
     def update_image_label(self, label_widget, img_np):
-        """Updates the image displayed in a QLabel."""
+        """Optimized image display update."""
         if img_np is None or img_np.size == 0:
             label_widget.setText("Sin Imagen")
             label_widget.clear()
             return
 
-        if img_np.shape[2] == 3:
-            img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
-        else:
-            img_rgb = img_np
+        # Convert to RGB if needed
+        img_rgb = cv2.cvtColor(
+            img_np, cv2.COLOR_BGR2RGB) if img_np.shape[2] == 3 else img_np
 
+        # Resize for display
+        img_rgb = cv2.resize(
+            img_rgb, (label_widget.width(), label_widget.height()))
+
+        # Create QImage
         h, w, ch = img_rgb.shape
-        bytes_per_line = ch * w
-        q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        label_widget.setPixmap(QPixmap.fromImage(q_img).scaled(
-            label_widget.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        q_img = QImage(img_rgb.data, w, h, w * ch, QImage.Format_RGB888)
+        label_widget.setPixmap(QPixmap.fromImage(q_img))
+
 
 class MainWindow(QMainWindow):
-    """Main application window for the vehicle re-identification system."""
+    """Optimized main application window."""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sistema de Re-Identificación de Vehículos")
         self.setGeometry(100, 100, 1400, 800)
+        self.init_ui()
+        self.init_video_processor()
 
-        self.processing = False
-        self.query_feature = None
-        self.query_image = None
-        self.detections = defaultdict(list)
-        self.selected_box = None
-
-        self._setup_ui()
-        self._setup_video_processor()
-
-    def _setup_ui(self):
-        """Sets up the main user interface."""
+    def init_ui(self):
+        """Initialize the main UI components."""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
+        # Control bar
         control_bar_layout = QHBoxLayout()
         self.control_button = QPushButton("Iniciar Procesamiento")
         self.control_button.clicked.connect(self.toggle_processing)
@@ -387,38 +409,47 @@ class MainWindow(QMainWindow):
         control_bar_layout.addWidget(self.view_selector)
         main_layout.addLayout(control_bar_layout)
 
+        # Main splitter
         main_splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(main_splitter)
 
+        # Camera view area
         camera_view_wrapper = QWidget()
         camera_view_layout = QVBoxLayout(camera_view_wrapper)
-        camera_view_layout.setContentsMargins(0,0,0,0)
+        camera_view_layout.setContentsMargins(0, 0, 0, 0)
         camera_view_layout.setSpacing(0)
 
         self.camera_stacked_widget = QStackedWidget()
         camera_view_layout.addWidget(self.camera_stacked_widget)
 
-        self._setup_grid_view()
-        self._setup_list_view()
+        self.init_grid_view()
+        self.init_list_view()
 
         main_splitter.addWidget(camera_view_wrapper)
 
+        # Details panel
         self.details_panel = QWidget()
         details_layout = QVBoxLayout(self.details_panel)
         self.details_panel.setMinimumWidth(380)
         self.details_panel.setMaximumWidth(450)
-        self.details_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        self.details_panel.setStyleSheet("background-color: #e8e8e8; border-left: 1px solid #aaa;")
+        self.details_panel.setSizePolicy(
+            QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.details_panel.setStyleSheet(
+            "background-color: #e8e8e8; border-left: 1px solid #aaa;")
 
+        # Query section
         query_section_label = QLabel("--- Vehículo de Consulta ---")
         query_section_label.setAlignment(Qt.AlignCenter)
-        query_section_label.setStyleSheet("font-weight: bold; margin-top: 10px; margin-bottom: 5px;")
+        query_section_label.setStyleSheet(
+            "font-weight: bold; margin-top: 10px; margin-bottom: 5px;")
         details_layout.addWidget(query_section_label)
 
-        self.query_display_label = QLabel("Seleccione un vehículo de cualquier cámara para consultar.")
+        self.query_display_label = QLabel(
+            "Seleccione un vehículo de cualquier cámara para consultar.")
         self.query_display_label.setAlignment(Qt.AlignCenter)
         self.query_display_label.setFixedSize(300, 300)
-        self.query_display_label.setStyleSheet("border: 2px dashed #aaa; background-color: #f5f5f5;")
+        self.query_display_label.setStyleSheet(
+            "border: 2px dashed #aaa; background-color: #f5f5f5;")
         query_label_container = QHBoxLayout()
         query_label_container.addStretch()
         query_label_container.addWidget(self.query_display_label)
@@ -426,29 +457,31 @@ class MainWindow(QMainWindow):
         details_layout.addLayout(query_label_container)
         details_layout.addSpacing(15)
 
+        # Similar vehicles section
         similar_section_label = QLabel("--- Vehículos Similares ---")
         similar_section_label.setAlignment(Qt.AlignCenter)
-        similar_section_label.setStyleSheet("font-weight: bold; margin-bottom: 5px;")
+        similar_section_label.setStyleSheet(
+            "font-weight: bold; margin-bottom: 5px;")
         details_layout.addWidget(similar_section_label)
 
         self.similar_scroll_area = QScrollArea()
         self.similar_scroll_area.setWidgetResizable(True)
         self.similar_vehicles_widget = QWidget()
-        self.similar_vehicles_layout = QVBoxLayout(self.similar_vehicles_widget)
+        self.similar_vehicles_layout = QVBoxLayout(
+            self.similar_vehicles_widget)
         self.similar_vehicles_layout.setAlignment(Qt.AlignTop)
         self.similar_scroll_area.setWidget(self.similar_vehicles_widget)
         details_layout.addWidget(self.similar_scroll_area)
 
         details_layout.addStretch()
-
         main_splitter.addWidget(self.details_panel)
-
-        main_splitter.setSizes([int(self.width() * 0.7), int(self.width() * 0.3)])
+        main_splitter.setSizes(
+            [int(self.width() * 0.7), int(self.width() * 0.3)])
 
         self.statusBar().showMessage("Listo")
 
-    def _setup_grid_view(self):
-        """Sets up the grid view for camera feeds."""
+    def init_grid_view(self):
+        """Initialize grid view layout."""
         grid_widget = QWidget()
         grid_layout = QGridLayout(grid_widget)
         grid_layout.setContentsMargins(5, 5, 5, 5)
@@ -466,8 +499,8 @@ class MainWindow(QMainWindow):
         self.camera_stacked_widget.addWidget(grid_widget)
         self.grid_view_index = self.camera_stacked_widget.indexOf(grid_widget)
 
-    def _setup_list_view(self):
-        """Sets up the list view for camera feeds."""
+    def init_list_view(self):
+        """Initialize list view layout."""
         list_scroll_area = QScrollArea()
         list_scroll_area.setWidgetResizable(True)
         list_widget = QWidget()
@@ -482,21 +515,30 @@ class MainWindow(QMainWindow):
             camera_view.click_callback = self.on_vehicle_selected
             self.camera_views_list.append(camera_view)
             list_layout.addWidget(camera_view)
-            camera_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            camera_view.setSizePolicy(
+                QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         list_scroll_area.setWidget(list_widget)
         self.camera_stacked_widget.addWidget(list_scroll_area)
-        self.list_view_index = self.camera_stacked_widget.indexOf(list_scroll_area)
+        self.list_view_index = self.camera_stacked_widget.indexOf(
+            list_scroll_area)
 
-    def _setup_video_processor(self):
-        """Initializes the video processing thread."""
+    def init_video_processor(self):
+        """Initialize video processing thread."""
+        self.processing = False
+        self.query_feature = None
+        self.query_image = None
+        self.detections = defaultdict(list)
+        self.selected_box = None
+
         self.video_processor = VideoProcessor()
         self.video_processor.update_frame.connect(self.update_camera_views)
-        self.video_processor.update_similarities.connect(self.update_similar_vehicles)
+        self.video_processor.update_similarities.connect(
+            self.update_similar_vehicles)
         self.video_processor.update_query.connect(self.update_query_view)
 
     def switch_view(self, index):
-        """Switches the display mode between grid and list."""
+        """Switch between grid and list views."""
         if index == 0:
             self.camera_stacked_widget.setCurrentIndex(self.grid_view_index)
             current_views = self.camera_views_grid
@@ -506,12 +548,13 @@ class MainWindow(QMainWindow):
         else:
             return
 
-        self.statusBar().showMessage(f"Cambiado a {self.view_selector.currentText()}")
+        self.statusBar().showMessage(
+            f"Cambiado a {self.view_selector.currentText()}")
         for cam_view in current_views:
             cam_view._draw_and_display()
 
     def toggle_processing(self):
-        """Starts or stops the video processing thread."""
+        """Toggle video processing on/off."""
         if self.processing:
             self.video_processor.stop()
             self.control_button.setText("Iniciar Procesamiento")
@@ -526,19 +569,22 @@ class MainWindow(QMainWindow):
         self.processing = not self.processing
 
     def update_camera_views(self, frames, detections):
-        """Updates all camera views with new frames and detections."""
+        """Update all camera views with new frames and detections."""
         self.detections = detections
 
         for i, frame in enumerate(frames):
             if i < len(self.camera_views_grid):
-                self.camera_views_grid[i].update_frame(frame, detections[i], self.selected_box)
+                self.camera_views_grid[i].update_frame(
+                    frame, detections[i], self.selected_box)
             if i < len(self.camera_views_list):
-                self.camera_views_list[i].update_frame(frame, detections[i], self.selected_box)
+                self.camera_views_list[i].update_frame(
+                    frame, detections[i], self.selected_box)
 
     def on_vehicle_selected(self, camera_id, x1, y1, x2, y2):
-        """Handles a vehicle selection event from a camera view."""
+        """Handle vehicle selection from camera view."""
         self.selected_box = (camera_id, x1, y1, x2, y2)
-        self.statusBar().showMessage(f"Vehículo seleccionado de la Cámara {camera_id+1}.")
+        self.statusBar().showMessage(
+            f"Vehículo seleccionado de la Cámara {camera_id+1}.")
 
         current_active_views = None
         if self.camera_stacked_widget.currentIndex() == self.grid_view_index:
@@ -549,13 +595,15 @@ class MainWindow(QMainWindow):
         if current_active_views and camera_id < len(current_active_views):
             full_frame = current_active_views[camera_id].current_frame
             if full_frame is None or not (0 <= y1 < y2 <= full_frame.shape[0] and 0 <= x1 < x2 <= full_frame.shape[1]):
-                self.statusBar().showMessage("Error: No se pudo recuperar el fotograma completo para recortar el vehículo seleccionado.")
+                self.statusBar().showMessage(
+                    "Error: No se pudo recuperar el fotograma completo para recortar el vehículo seleccionado.")
                 return
 
             crop = full_frame[y1:y2, x1:x2]
 
             if crop.size == 0 or crop.shape[0] == 0 or crop.shape[1] == 0:
-                self.statusBar().showMessage("Error: El recorte seleccionado está vacío o no es válido.")
+                self.statusBar().showMessage(
+                    "Error: El recorte seleccionado está vacío o no es válido.")
                 return
 
             for cam_view in self.camera_views_grid + self.camera_views_list:
@@ -563,10 +611,11 @@ class MainWindow(QMainWindow):
 
             Thread(target=self.process_query, args=(crop,)).start()
         else:
-            self.statusBar().showMessage("Error: No se encontró la vista de la cámara para el vehículo seleccionado.")
+            self.statusBar().showMessage(
+                "Error: No se encontró la vista de la cámara para el vehículo seleccionado.")
 
     def process_query(self, crop_image):
-        """Processes the selected vehicle image to set it as the query."""
+        """Process selected vehicle image to set as query."""
         try:
             feature = extract_reid_feature(crop_image)
             self.query_feature = feature
@@ -576,54 +625,63 @@ class MainWindow(QMainWindow):
             with self.video_processor.similar_vehicles_lock:
                 self.video_processor.similar_vehicles.clear()
             self.update_similar_vehicles({})
-            self.statusBar().showMessage("Vehículo de consulta establecido. Buscando vehículos similares...")
+            self.statusBar().showMessage(
+                "Vehículo de consulta establecido. Buscando vehículos similares...")
         except Exception as e:
             self.statusBar().showMessage(f"Error al procesar la consulta: {e}")
 
     def update_query_view(self, image):
-        """Updates the display of the query vehicle image."""
+        """Update the query vehicle display."""
         if image is None or image.size == 0:
-            self.query_display_label.setText("No se ha seleccionado ningún vehículo de consulta.")
+            self.query_display_label.setText(
+                "No se ha seleccionado ningún vehículo de consulta.")
             self.query_display_label.clear()
             return
 
-        if image.shape[2] == 3:
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        else:
-            image_rgb = image
+        # Convert to RGB if needed
+        image_rgb = cv2.cvtColor(
+            image, cv2.COLOR_BGR2RGB) if image.shape[2] == 3 else image
 
+        # Resize for display
+        image_rgb = cv2.resize(
+            image_rgb, (self.query_display_label.width(), self.query_display_label.height()))
+
+        # Create QImage
         h, w, ch = image_rgb.shape
-        bytes_per_line = ch * w
-        q_img = QImage(image_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        q_img = QImage(image_rgb.data, w, h, w * ch, QImage.Format_RGB888)
 
         self.query_display_label.clear()
-        self.query_display_label.setPixmap(QPixmap.fromImage(q_img).scaled(
-            self.query_display_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.query_display_label.setPixmap(QPixmap.fromImage(q_img))
         self.query_display_label.setText("")
 
     def update_similar_vehicles(self, similar_vehicles_dict):
-        """Updates the list of similar vehicles displayed."""
+        """Update the list of similar vehicles."""
+        # Clear existing widgets
         for i in reversed(range(self.similar_vehicles_layout.count())):
             widget = self.similar_vehicles_layout.itemAt(i).widget()
             if widget:
                 widget.setParent(None)
 
         if not similar_vehicles_dict and self.query_feature is None:
-            no_matches = QLabel("Seleccione un vehículo para comenzar a buscar similitudes.")
+            no_matches = QLabel(
+                "Seleccione un vehículo para comenzar a buscar similitudes.")
             no_matches.setAlignment(Qt.AlignCenter)
             self.similar_vehicles_layout.addWidget(no_matches)
             return
         elif not similar_vehicles_dict and self.query_feature is not None:
-            no_matches = QLabel("No se encontraron vehículos similares todavía.")
+            no_matches = QLabel(
+                "No se encontraron vehículos similares todavía.")
             no_matches.setAlignment(Qt.AlignCenter)
             self.similar_vehicles_layout.addWidget(no_matches)
             return
 
+        # Add new matches
         sorted_vehicles = sorted(similar_vehicles_dict.items(),
                                  key=lambda x: x[1]['similarity'],
                                  reverse=True)[:MAX_COMPARISONS]
 
-        query_data_for_display = (self.query_image, self.query_feature) if self.query_image is not None else None
+        query_data_for_display = (
+            self.query_image, self.query_feature) if self.query_image is not None else None
 
         for (key, vehicle) in sorted_vehicles:
             widget = SimilarVehicleWidget(vehicle, query_data_for_display)
@@ -632,10 +690,11 @@ class MainWindow(QMainWindow):
         self.similar_vehicles_layout.addStretch()
 
     def closeEvent(self, event):
-        """Handles graceful shutdown when the window is closed."""
+        """Handle window close event."""
         if self.processing:
             self.video_processor.stop()
         event.accept()
+
 
 if __name__ == '__main__':
     os.makedirs(SOURCES_FOLDER, exist_ok=True)
